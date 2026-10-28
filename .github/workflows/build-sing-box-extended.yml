@@ -26,7 +26,7 @@ env:
   # Паттерн тегов форка, например v1.14.1-extended-2.7.2
   TAG_PATTERN: "v*-extended-*"
   # Дополнительные теги сверху release/DEFAULT_BUILD_TAGS_OTHERS
-  EXTRA_TAGS: "with_admin_panel,with_v2ray_api"
+  EXTRA_TAGS: "with_v2ray_api"
 
 jobs:
   calculate_version:
