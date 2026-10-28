@@ -1,0 +1,386 @@
+name: Build and Release sing-box-extended
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "sing-box-extended version, example: 1.14.1-extended-2.7.2 or v1.14.1-extended-2.7.2. Empty = latest"
+        required: false
+        type: string
+        default: ""
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 */12 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: shtorm-7/sing-box-extended
+  # Паттерн тегов форка, например v1.14.1-extended-2.7.2
+  TAG_PATTERN: "v*-extended-*"
+  # Дополнительные теги сверху release/DEFAULT_BUILD_TAGS_OTHERS
+  EXTRA_TAGS: "with_admin_panel,with_v2ray_api"
+
+jobs:
+  calculate_version:
+    name: Calculate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_tag.outputs.version }}
+      tag_name: ${{ steps.get_tag.outputs.tag_name }}
+      release_exists: ${{ steps.check_release.outputs.release_exists }}
+      should_build: ${{ steps.check_release.outputs.should_build }}
+      changelog: ${{ steps.extract_changelog.outputs.changelog }}
+
+    steps:
+      - name: Checkout shtorm-7/sing-box-extended
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          fetch-depth: 0
+
+      - name: Get requested or latest tag
+        id: get_tag
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force
+
+          if [ -n "${REQUESTED_VERSION}" ]; then
+            VERSION="${REQUESTED_VERSION#v}"
+            TAG_NAME="v${VERSION}"
+
+            if ! git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
+              echo "Requested upstream tag does not exist: ${TAG_NAME}"
+              exit 1
+            fi
+          else
+            TAG_NAME="$(git tag --list "${TAG_PATTERN}" --sort=-v:refname | head -n1)"
+
+            if [ -z "${TAG_NAME}" ]; then
+              echo "No tags matching '${TAG_PATTERN}', falling back to any v* tag"
+              TAG_NAME="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+            fi
+
+            if [ -z "${TAG_NAME}" ]; then
+              echo "No tags found in ${UPSTREAM_REPO}"
+              exit 1
+            fi
+
+            VERSION="${TAG_NAME#v}"
+          fi
+
+          echo "Selected tag is: ${TAG_NAME}"
+          echo "Selected version is: ${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog
+        id: extract_changelog
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.get_tag.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          # 1) Пробуем взять тело релиза из форка
+          CHANGELOG="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG_NAME}" \
+              | jq -r '.body // ""'
+          )" || CHANGELOG=""
+
+          # 2) Если релиза нет — собираем список коммитов с предыдущего тега
+          if [ -z "${CHANGELOG//[[:space:]]/}" ]; then
+            PREV_TAG="$(
+              git tag --list "${TAG_PATTERN}" --sort=v:refname \
+                | grep -x -B1 "${TAG_NAME}" | head -n1 || true
+            )"
+
+            if [ -n "${PREV_TAG}" ] && [ "${PREV_TAG}" != "${TAG_NAME}" ]; then
+              CHANGELOG="$(
+                {
+                  echo "Changes since ${PREV_TAG}:"
+                  echo
+                  git log --no-merges --pretty='- %s (%h)' "${PREV_TAG}..${TAG_NAME}" | head -n 100
+                }
+              )"
+            else
+              CHANGELOG="No changelog available"
+            fi
+          fi
+
+          DELIM="CHANGELOG_$(openssl rand -hex 8)"
+          {
+            echo "changelog<<${DELIM}"
+            echo "${CHANGELOG}"
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists in THIS repo
+        id: check_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.get_tag.outputs.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          HTTP_CODE="$(
+            curl -sS \
+              -o /tmp/release-check.json \
+              -w "%{http_code}" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
+          )"
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Release ${TAG_NAME} already exists in ${GITHUB_REPOSITORY}"
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "Release ${TAG_NAME} does not exist in ${GITHUB_REPOSITORY}"
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unexpected GitHub API response: $HTTP_CODE"
+            cat /tmp/release-check.json
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual run: build is forced"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "No existing release: build is allowed"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Existing release on non-manual run: build is skipped"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build_linux:
+    name: Build Linux ${{ matrix.name }}
+    needs:
+      - calculate_version
+    if: needs.calculate_version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: amd64, goarch: amd64, goarm: "" }
+          - { name: arm64, goarch: arm64, goarm: "" }
+          # - { name: armv7, goarch: arm, goarm: "7" }
+
+    steps:
+      - name: Checkout shtorm-7/sing-box-extended
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.calculate_version.outputs.tag_name }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+
+      - name: Setup Node.js (admin panel)
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ matrix.name }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.name }}-
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod download
+
+      - name: Build admin panel
+        shell: bash
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+
+          ADMIN_PANEL_DIR="service/admin_panel"
+
+          if [ ! -d "${ADMIN_PANEL_DIR}/web" ]; then
+            echo "No admin panel sources in this tag, skipping"
+            exit 0
+          fi
+
+          (
+            cd "${ADMIN_PANEL_DIR}/web"
+            if [ -f package-lock.json ]; then
+              npm ci --no-fund --no-audit
+            else
+              npm install --no-fund --no-audit
+            fi
+            npm run build
+          )
+
+          # Пакуем dist для //go:embed (хост-архитектура, GOOS/GOARCH не задаём)
+          go run ./cmd/internal/admin_panel_pack -dir "${ADMIN_PANEL_DIR}/dist"
+
+      - name: Build sing-box-extended
+        shell: bash
+        env:
+          VERSION: ${{ needs.calculate_version.outputs.version }}
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+
+          # Базовые теги и ldflags берём из самого форка, чтобы не отставать от него
+          if [ -f release/DEFAULT_BUILD_TAGS_OTHERS ]; then
+            BASE_TAGS="$(tr -d '[:space:]' < release/DEFAULT_BUILD_TAGS_OTHERS)"
+          else
+            BASE_TAGS="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale"
+          fi
+
+          # Объединяем с EXTRA_TAGS и убираем дубли
+          TAGS="$(
+            printf '%s,%s' "${BASE_TAGS}" "${EXTRA_TAGS}" \
+              | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -
+          )"
+
+          LDFLAGS_SHARED=""
+          if [ -f release/LDFLAGS ]; then
+            LDFLAGS_SHARED="$(tr '\n' ' ' < release/LDFLAGS)"
+          fi
+
+          echo "Build tags: ${TAGS}"
+          echo "Shared ldflags: ${LDFLAGS_SHARED}"
+
+          mkdir -p dist
+
+          go build -v -trimpath \
+            -tags "${TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            -o "dist/sing-box" \
+            ./cmd/sing-box
+
+      - name: Prepare binary for upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY_NAME="sing-box-extended-linux-${{ matrix.name }}"
+          mkdir -p artifacts
+          cp dist/sing-box "artifacts/${BINARY_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux_${{ matrix.name }}
+          path: artifacts/*
+
+  release:
+    name: Create or update Release
+    needs:
+      - calculate_version
+      - build_linux
+    if: needs.calculate_version.outputs.should_build == 'true' && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Debug artifact structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Artifacts:"
+          find artifacts -type f | sort
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum sing-box-extended-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Prepare release notes
+        shell: bash
+        env:
+          CHANGELOG: ${{ needs.calculate_version.outputs.changelog }}
+          TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Built from [${UPSTREAM_REPO}@${TAG_NAME}](https://github.com/${UPSTREAM_REPO}/tree/${TAG_NAME})"
+            echo
+            printf '%s\n' "$CHANGELOG"
+          } > RELEASE_NOTES.md
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
+          VERSION: ${{ needs.calculate_version.outputs.version }}
+          RELEASE_EXISTS: ${{ needs.calculate_version.outputs.release_exists }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t FILES < <(find artifacts -type f | sort)
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "No artifacts found"
+            exit 1
+          fi
+
+          if [ "$RELEASE_EXISTS" = "true" ]; then
+            echo "Release $TAG_NAME already exists, uploading assets with --clobber"
+
+            gh release edit "$TAG_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$VERSION" \
+              --notes-file RELEASE_NOTES.md
+
+            gh release upload "$TAG_NAME" "${FILES[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            echo "Creating release $TAG_NAME"
+
+            gh release create "$TAG_NAME" "${FILES[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$VERSION" \
+              --notes-file RELEASE_NOTES.md
+          fi
